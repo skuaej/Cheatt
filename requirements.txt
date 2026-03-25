@@ -2,4 +2,4 @@ aiogram
 motor
 aiohttp
 python-dotenv
-
+psutil
