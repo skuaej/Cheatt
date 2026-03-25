@@ -20,7 +20,7 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
 
-# Bot ko default HTML mode par set kar diya hai
+# Default ParseMode HTML set kar diya hai taaki <code> tag kaam kare
 bot = Bot(token=BOT_TOKEN, default_parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
@@ -34,7 +34,6 @@ def parse_caption(text):
     match = re.search(r"🆔️\d+:\s*([^\[\n\r]+)", text)
     if match:
         return match.group(1).strip()
-    # Agar format match nahi hua toh pehli line
     return text.split('\n')[0].strip()
 
 def get_sys_info():
@@ -59,7 +58,7 @@ async def handle_media(message: types.Message):
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # <code> tag ensures one-tap copy on Telegram
+        # <code> tag ensures auto-copy on Telegram mobile
         await message.reply(f"<code>/take {existing['caption']}</code>")
     else:
         if message.caption:
@@ -78,7 +77,7 @@ async def handle_media(message: types.Message):
                     upsert=True
                 )
                 
-                # Naya message bhi copy format mein
+                # Reply with ONLY the copyable command
                 await message.reply(f"<code>/take {clean_name}</code>")
                 
                 # Silent Log
@@ -89,7 +88,7 @@ async def handle_media(message: types.Message):
             except Exception as e:
                 await message.reply(f"Error: {e}")
         else:
-            await message.reply("Bhai caption (name) toh likho!")
+            await message.reply("Bhai caption (name) toh likh!")
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
@@ -106,7 +105,7 @@ async def search_media(message: types.Message):
                 message_id=result["msg_id"]
             )
         except:
-            await message.reply("Error: Bot channel mein Admin nahi hai!")
+            await message.reply("Error: Bot backup channel mein Admin nahi hai!")
     else:
         await message.reply("Database mein nahi mila.")
 
@@ -131,9 +130,9 @@ async def cmd_total(message: types.Message):
     count = await collection.count_documents({})
     await message.reply(f"📊 <b>Total DB:</b> <code>{count}</code>")
 
-# --- KOYEB PORT 8000 SERVER ---
+# --- KOYEB PORT 8000 ---
 async def health_check(request):
-    return web.Response(text="Bot is Live", status=200)
+    return web.Response(text="Bot Alive", status=200)
 
 async def main():
     await collection.create_index("file_unique_id", unique=True)
@@ -143,10 +142,10 @@ async def main():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Koyeb Port 8000 setup
+    # Koyeb Port 8000
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Port 8000 started. Bot is polling.")
+    print("🚀 Port 8000 Started. Bot is Live.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
