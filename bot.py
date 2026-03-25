@@ -6,6 +6,7 @@ import logging
 import shutil
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramRetryAfter
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 from dotenv import load_dotenv
@@ -26,6 +27,9 @@ dp = Dispatcher()
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
+
+# --- SEMAPHORE (Anti-Ban Queue) ---
+sem = asyncio.Semaphore(1)
 
 # --- UTILS ---
 def parse_caption(text):
@@ -49,61 +53,65 @@ def get_sys_info():
 
 # --- CORE SAVING LOGIC ---
 async def process_and_save(message: types.Message):
-    media = message.photo[-1] if message.photo else message.video
-    if not media: return
-    
-    unique_id = media.file_unique_id
-    existing = await collection.find_one({"file_unique_id": unique_id})
+    async with sem:
+        media = message.photo[-1] if message.photo else message.video
+        if not media: return
+        
+        unique_id = media.file_unique_id
+        existing = await collection.find_one({"file_unique_id": unique_id})
 
-    if existing:
-        # One-tap copy reply
-        await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
-    else:
+        if existing:
+            # Click to copy format backticks mein
+            await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
+            return
+
         clean_name = parse_caption(message.caption)
-        if clean_name:
-            try:
-                # Copy to Backup Storage Channel
-                backup = await bot.copy_message(
-                    chat_id=MEDIA_CHANNEL_ID,
-                    from_chat_id=message.chat.id,
-                    message_id=message.message_id
-                )
-                
-                # Save to MongoDB
-                await collection.update_one(
-                    {"file_unique_id": unique_id},
-                    {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
-                    upsert=True
-                )
-                
-                # One-tap copy command reply
-                await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
-                
-                # Log to Log Channel
-                try:
-                    await bot.send_message(LOG_CHANNEL_ID, f"🆕 **Saved:** `{clean_name}`", parse_mode="Markdown")
-                except: pass
-            except Exception as e:
-                logging.error(f"Backup Error: {e}")
+        if not clean_name: return
+
+        try:
+            # Backup to Immortal Channel
+            backup = await bot.copy_message(
+                chat_id=MEDIA_CHANNEL_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.message_id
+            )
+            
+            # Save to MongoDB
+            await collection.update_one(
+                {"file_unique_id": unique_id},
+                {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
+                upsert=True
+            )
+            
+            # Clean Reply: Touch to copy
+            await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
+            
+            # Anti-Ban Sleep (Dheere dheere save karega)
+            await asyncio.sleep(1.5)
+
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await process_and_save(message)
+        except Exception as e:
+            logging.error(f"Error: {e}")
 
 # --- HANDLERS ---
 
-# Handle Media in Private Chats and Groups
+# 1. Media Saving (Private & Channel)
 @dp.message(F.photo | F.video)
-async def handle_private_media(message: types.Message):
+async def handle_private(message: types.Message):
     await process_and_save(message)
 
-# Handle Media in Channels (Yeh missing tha!)
 @dp.channel_post(F.photo | F.video)
-async def handle_channel_media(message: types.Message):
-    # Sirf tere Source Channel se hi save karega
+async def handle_channel(message: types.Message):
     if message.chat.id == SOURCE_CHANNEL_ID:
         await process_and_save(message)
 
+# 2. Search Media (Restored)
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
     query = message.text.replace("/search", "").strip().lower()
-    if not query: return await message.reply("Usage: `/search Name`")
+    if not query: return await message.reply("Bhai name likh! `/search Name`")
 
     result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
     if result:
@@ -114,19 +122,27 @@ async def search_media(message: types.Message):
                 message_id=result["msg_id"]
             )
         except:
-            await message.reply("❌ Error: Bot ko Backup Channel mein Admin banao!")
+            await message.reply("❌ Error: Bot backup channel mein Admin nahi hai!")
     else:
         await message.reply("❌ Database mein nahi mila.")
 
+# 3. Ping (Restored with Sys Info)
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message):
     start = time.time()
-    msg = await message.answer("⚡ Checking...")
+    msg = await message.answer("⚡ Checking System...")
     latency = round((time.time() - start) * 1000)
     ram_u, ram_t, sto_u, sto_t = get_sys_info()
-    status_msg = f"🚀 **Status:** Healthy\n⏱ **Ping:** `{latency}ms`\n📟 **RAM:** `{ram_u}MB / {ram_t}MB`"
-    await msg.edit_text(text=status_msg)
+    
+    status_msg = (
+        f"🚀 **Bot Health:** Healthy\n"
+        f"⏱ **Ping:** `{latency}ms`\n"
+        f"📟 **RAM:** `{ram_u}MB / {ram_t}MB`\n"
+        f"💾 **Storage:** `{sto_u}GB / {sto_t}GB`"
+    )
+    await msg.edit_text(text=status_msg, parse_mode="Markdown")
 
+# 4. Total Count
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
     if message.from_user.id != OWNER_ID: return
@@ -147,10 +163,10 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Bot is running with Channel Support on Port 8000")
+    print("🚀 All commands restored. Bot is polling.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-    
+            
