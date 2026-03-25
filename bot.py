@@ -26,8 +26,8 @@ client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
 
-# Semaphore (5 media at a time)
-sem = asyncio.Semaphore(5)
+# Strict Semaphore (1 at a time for Bulk Safety)
+sem = asyncio.Semaphore(1)
 
 # --- UTILS ---
 def parse_caption(text):
@@ -37,7 +37,7 @@ def parse_caption(text):
         return match.group(1).strip()
     return text.split('\n')[0].strip()
 
-# --- CORE SAVING LOGIC ---
+# --- THE IMMORTAL SAVER ---
 async def process_and_save(message: types.Message):
     async with sem:
         media = message.photo[-1] if message.photo else message.video
@@ -47,56 +47,64 @@ async def process_and_save(message: types.Message):
         existing = await collection.find_one({"file_unique_id": unique_id})
 
         if existing:
-            await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
+            # Duplicate detection
             return 
 
         clean_name = parse_caption(message.caption)
         if not clean_name: return
 
         try:
+            # 1. Copy to Storage
             backup = await bot.copy_message(
                 chat_id=MEDIA_CHANNEL_ID,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id
             )
+            
+            # 2. Save to Database
             await collection.update_one(
                 {"file_unique_id": unique_id},
                 {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
                 upsert=True
             )
+            
             print(f"✅ SAVED: {clean_name}")
-            await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
-            await asyncio.sleep(1)
+            
+            # 3. ANTI-FLOOD DELAY (3 seconds gap for safety)
+            await asyncio.sleep(3)
+
+        except TelegramRetryAfter as e:
+            # AGAR TELEGRAM BOLTA HAI RUKO, TOH BOT RUK JAYEGA
+            print(f"⚠️ FLOOD WAIT: Sleeping for {e.retry_after} seconds...")
+            await asyncio.sleep(e.retry_after + 2)
+            # Retry after sleeping
+            await process_and_save(message)
         except Exception as e:
             print(f"❌ ERROR: {e}")
 
-# --- ALL COMMANDS (RESTORED & FIXED) ---
-
-@dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.reply("Bot is Alive! Send me photos with captions or use /search.")
+# --- COMMANDS ---
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
     query = message.text.replace("/search", "").strip()
-    if not query: return await message.reply("Bhai name toh likh! `/search Name`")
+    if not query: return await message.reply("Bhai name likh! `/search Name`")
     
     result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
     if result:
-        await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=result["msg_id"])
+        try:
+            await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=result["msg_id"])
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await message.reply("Too many searches, try in a minute.")
     else:
         await message.reply("❌ Database mein nahi mila.")
 
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
     count = await collection.count_documents({})
-    await message.reply(f"📊 **Total Database:** `{count}`")
+    await message.reply(f"📊 **Database Count:** `{count}`")
 
-@dp.message(Command("ping"))
-async def cmd_ping(message: types.Message):
-    await message.reply("⚡ **Pong!** Bot is running perfectly.")
-
-# Handle Media
+# --- HANDLERS ---
 @dp.message(F.photo | F.video)
 async def handle_private(message: types.Message):
     await process_and_save(message)
@@ -106,9 +114,9 @@ async def handle_channel(message: types.Message):
     if str(message.chat.id) == str(SOURCE_CHANNEL_ID):
         await process_and_save(message)
 
-# --- KOYEB SERVER ---
+# --- SERVER ---
 async def health_check(request):
-    return web.Response(text="Healthy", status=200)
+    return web.Response(text="Bot is Alive", status=200)
 
 async def main():
     await collection.create_index("file_unique_id", unique=True)
@@ -119,12 +127,10 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    # --- CONFLICT KILLER ---
-    print("🛠 Cleaning existing sessions...")
+    # Clean Conflict
     await bot.delete_webhook(drop_pending_updates=True)
-    
-    print("🚀 Bot is starting fresh...")
-    await dp.start_polling(bot, skip_updates=True)
+    print("🚀 Flood-Proof Engine Started...")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
