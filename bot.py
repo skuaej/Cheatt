@@ -20,7 +20,7 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
 
-# Bot with HTML ParseMode for clean one-tap copy
+# Bot ko default HTML mode par set kar diya hai
 bot = Bot(token=BOT_TOKEN, default_parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
@@ -34,6 +34,7 @@ def parse_caption(text):
     match = re.search(r"🆔️\d+:\s*([^\[\n\r]+)", text)
     if match:
         return match.group(1).strip()
+    # Agar format match nahi hua toh pehli line
     return text.split('\n')[0].strip()
 
 def get_sys_info():
@@ -58,13 +59,13 @@ async def handle_media(message: types.Message):
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # One-tap copy only (HTML code tag makes it clickable/copyable)
+        # <code> tag ensures one-tap copy on Telegram
         await message.reply(f"<code>/take {existing['caption']}</code>")
     else:
         if message.caption:
             clean_name = parse_caption(message.caption)
             try:
-                # Backup to Media Channel
+                # Immortal Backup
                 backup = await bot.copy_message(
                     chat_id=MEDIA_CHANNEL_ID,
                     from_chat_id=message.chat.id,
@@ -77,7 +78,7 @@ async def handle_media(message: types.Message):
                     upsert=True
                 )
                 
-                # ONLY the command, nothing else. One-tap copy enabled.
+                # Naya message bhi copy format mein
                 await message.reply(f"<code>/take {clean_name}</code>")
                 
                 # Silent Log
@@ -88,7 +89,7 @@ async def handle_media(message: types.Message):
             except Exception as e:
                 await message.reply(f"Error: {e}")
         else:
-            await message.reply("Bhai, photo ke saath name toh likh!")
+            await message.reply("Bhai caption (name) toh likho!")
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
@@ -105,7 +106,7 @@ async def search_media(message: types.Message):
                 message_id=result["msg_id"]
             )
         except:
-            await message.reply("Media channel mein Admin banao lodu!")
+            await message.reply("Error: Bot channel mein Admin nahi hai!")
     else:
         await message.reply("Database mein nahi mila.")
 
@@ -128,11 +129,11 @@ async def cmd_ping(message: types.Message):
 async def cmd_total(message: types.Message):
     if message.from_user.id != OWNER_ID: return
     count = await collection.count_documents({})
-    await message.reply(f"📊 <b>Total:</b> <code>{count}</code>")
+    await message.reply(f"📊 <b>Total DB:</b> <code>{count}</code>")
 
 # --- KOYEB PORT 8000 SERVER ---
 async def health_check(request):
-    return web.Response(text="Bot is Alive", status=200)
+    return web.Response(text="Bot is Live", status=200)
 
 async def main():
     await collection.create_index("file_unique_id", unique=True)
@@ -142,10 +143,10 @@ async def main():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Koyeb 8000 port
+    # Koyeb Port 8000 setup
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Port 8000 is Active. Bot is running.")
+    print("🚀 Port 8000 started. Bot is polling.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
