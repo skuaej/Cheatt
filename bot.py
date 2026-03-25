@@ -3,6 +3,8 @@ import time
 import asyncio
 import re
 import logging
+import psutil
+import shutil
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -21,21 +23,30 @@ MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# MongoDB Setup
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
 
-# --- PARSING LOGIC (Sirf Name nikalne ke liye) ---
+# --- UTILS ---
 def parse_caption(text):
-    # Pattern: 🆔️9828: Kaori Miyazono [🏖] -> Sirf "Kaori Miyazono" nikalega
+    # Pattern: 🆔️9828: Kaori Miyazono [🏖] -> "Kaori Miyazono"
     match = re.search(r"🆔️\d+:\s*([^\[\n\r]+)", text)
     if match:
-        name = match.group(1).strip()
-        return name
-    # Agar format alag hai toh pehli line uthayega
+        return match.group(1).strip()
     return text.split('\n')[0].strip()
 
-# --- MEDIA HANDLER (Photo & Video) ---
+def get_sys_info():
+    mem = psutil.virtual_memory()
+    ram_used = round(mem.used / (1024**2), 2)
+    ram_total = round(mem.total / (1024**2), 2)
+    total, used, free = shutil.disk_usage("/")
+    sto_used = round(used / (1024**3), 2)
+    sto_total = round(total / (1024**3), 2)
+    return ram_used, ram_total, sto_used, sto_total
+
+# --- HANDLERS ---
+
 @dp.message(F.photo | F.video)
 async def handle_media(message: types.Message):
     media = message.photo[-1] if message.photo else message.video
@@ -44,20 +55,18 @@ async def handle_media(message: types.Message):
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # Puraana data: Click to copy format
         await message.reply(f"`/take {existing['caption']}`")
     else:
         if message.caption:
             clean_name = parse_caption(message.caption)
             try:
-                # Backup to Media Channel
+                # Immortal Backup
                 backup = await bot.copy_message(
                     chat_id=MEDIA_CHANNEL_ID,
                     from_chat_id=message.chat.id,
                     message_id=message.message_id
                 )
                 
-                # Save to DB
                 await collection.update_one(
                     {"file_unique_id": unique_id},
                     {"$set": {
@@ -66,67 +75,66 @@ async def handle_media(message: types.Message):
                     }},
                     upsert=True
                 )
-                # Success Reply
+                # Format fixed: No extra quotes, one-tap copy
                 await message.reply(f"📥 **Saved!**\n\n`/take {clean_name}`")
             except Exception as e:
-                await message.reply(f"❌ Backup Error: {e}")
-        else:
-            await message.reply("❌ Bhai, isme caption nahi hai! Caption ke bina naam kaise nikalun?")
+                await message.reply(f"❌ Error: {e}")
 
-# --- SEARCH COMMAND (/search name) ---
-@dp.message(Command("search"))
-async def search_media(message: types.Message):
-    args = message.text.split(" ", 1)
-    if len(args) < 2:
-        await message.reply("Usage: `/search Kaori`")
-        return
-
-    query = args[1].strip()
-    # Case-insensitive search in DB
-    result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
+@dp.message(Command("ping"))
+async def cmd_ping(message: types.Message):
+    start_time = time.time()
+    msg = await message.answer("⚡ Checking System...")
+    latency = round((time.time() - start_time) * 1000)
     
-    if result:
-        try:
-            await bot.copy_message(
-                chat_id=message.chat.id,
-                from_chat_id=MEDIA_CHANNEL_ID,
-                message_id=result["msg_id"]
-            )
-        except:
-            await message.reply("❌ Media channel mein nahi mila!")
-    else:
-        await message.reply("❌ Database mein ye naam nahi hai.")
+    ram_u, ram_t, sto_u, sto_t = get_sys_info()
+    status_msg = (
+        f"🚀 **Bot Health: Healthy**\n\n"
+        f"⏱ **Ping:** `{latency}ms`\n"
+        f"📟 **RAM:** `{ram_u}MB / {ram_t}MB`\n"
+        f"💾 **Storage:** `{sto_u}GB / {sto_t}GB`"
+    )
+    await msg.edit(text=status_msg)
 
-# --- OWNER COMMANDS ---
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
     if message.from_user.id != OWNER_ID: return
     count = await collection.count_documents({})
     await message.reply(f"📊 **Total Database:** `{count}`")
 
-# --- KOYEB PORT 8080 HEALTH CHECK ---
+# --- KOYEB SERVER (Fixed Concurrency) ---
 async def health_check(request):
-    return web.Response(text="Bot is Alive!", status=200)
+    return web.Response(text="I am alive!", status=200)
 
 async def start_server():
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080) # Fixed for Koyeb
+    # 0.0.0.0 is mandatory for Koyeb health checks
+    site = web.TCPSite(runner, '0.0.0.0', 8080)
     await site.start()
+    print("✅ Port 8080 Web Server Started.")
 
 async def main():
-    # Indexes for fast search
+    # 1. Database Indexing
     await collection.create_index("file_unique_id", unique=True)
-    await collection.create_index("caption")
     
-    # Start Health Server
+    # 2. Show Total Characters in Logs on Startup
+    total_chars = await collection.count_documents({})
+    print("=" * 40)
+    print(f"📊 STARTUP LOG: Total Characters in DB: {total_chars}")
+    print("=" * 40)
+
+    # 3. Start Web Server
     await start_server()
-    print("🚀 Koyeb Health Check Server on Port 8080 is Running")
-    
+
+    # 4. Start Bot Polling
+    print("🚀 Bot Polling Started...")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Bot Stopped!")
