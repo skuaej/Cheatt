@@ -17,8 +17,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
-MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID")) # Storage
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID")) # New Source
+MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID")) 
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -29,7 +29,7 @@ collection = db["cheats"]
 
 # --- UTILS ---
 def parse_caption(text):
-    # Pattern: 🆔️9828: Kaori Miyazono [🏖] -> "Kaori Miyazono"
+    if not text: return None
     match = re.search(r"🆔️\d+:\s*([^\[\n\r]+)", text)
     if match:
         return match.group(1).strip()
@@ -47,39 +47,36 @@ def get_sys_info():
     total, used, free = shutil.disk_usage("/")
     return ram_u, ram_t, round(used / (1024**3), 2), round(total / (1024**3), 2)
 
-# --- HANDLERS ---
-
-@dp.message(F.photo | F.video)
-async def handle_media(message: types.Message):
-    # Photo/Video detection
+# --- CORE SAVING LOGIC ---
+async def process_and_save(message: types.Message):
     media = message.photo[-1] if message.photo else message.video
-    unique_id = media.file_unique_id
+    if not media: return
     
-    # Check if duplicate
+    unique_id = media.file_unique_id
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # Markdown backticks for one-tap copy (CLEAN)
+        # One-tap copy reply
         await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
     else:
-        if message.caption:
-            clean_name = parse_caption(message.caption)
+        clean_name = parse_caption(message.caption)
+        if clean_name:
             try:
-                # Copy message to Media Backup Channel (Immortal)
+                # Copy to Backup Storage Channel
                 backup = await bot.copy_message(
                     chat_id=MEDIA_CHANNEL_ID,
                     from_chat_id=message.chat.id,
                     message_id=message.message_id
                 )
                 
-                # Save Message ID and Name to DB
+                # Save to MongoDB
                 await collection.update_one(
                     {"file_unique_id": unique_id},
                     {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
                     upsert=True
                 )
                 
-                # Return one-tap copyable command
+                # One-tap copy command reply
                 await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
                 
                 # Log to Log Channel
@@ -87,19 +84,28 @@ async def handle_media(message: types.Message):
                     await bot.send_message(LOG_CHANNEL_ID, f"🆕 **Saved:** `{clean_name}`", parse_mode="Markdown")
                 except: pass
             except Exception as e:
-                await message.reply(f"❌ Error: {e}")
-        else:
-            # Silence if no caption, or you can add a reminder
-            pass
+                logging.error(f"Backup Error: {e}")
+
+# --- HANDLERS ---
+
+# Handle Media in Private Chats and Groups
+@dp.message(F.photo | F.video)
+async def handle_private_media(message: types.Message):
+    await process_and_save(message)
+
+# Handle Media in Channels (Yeh missing tha!)
+@dp.channel_post(F.photo | F.video)
+async def handle_channel_media(message: types.Message):
+    # Sirf tere Source Channel se hi save karega
+    if message.chat.id == SOURCE_CHANNEL_ID:
+        await process_and_save(message)
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
     query = message.text.replace("/search", "").strip().lower()
     if not query: return await message.reply("Usage: `/search Name`")
 
-    # Partial match search
     result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
-    
     if result:
         try:
             await bot.copy_message(
@@ -118,13 +124,7 @@ async def cmd_ping(message: types.Message):
     msg = await message.answer("⚡ Checking...")
     latency = round((time.time() - start) * 1000)
     ram_u, ram_t, sto_u, sto_t = get_sys_info()
-    
-    status_msg = (
-        f"🚀 **Bot Health:** Healthy\n"
-        f"⏱ **Ping:** `{latency}ms`\n"
-        f"📟 **RAM:** `{ram_u}MB / {ram_t}MB`\n"
-        f"💾 **Storage:** `{sto_u}GB / {sto_t}GB`"
-    )
+    status_msg = f"🚀 **Status:** Healthy\n⏱ **Ping:** `{latency}ms`\n📟 **RAM:** `{ram_u}MB / {ram_t}MB`"
     await msg.edit_text(text=status_msg)
 
 @dp.message(Command("total"))
@@ -145,13 +145,12 @@ async def main():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Koyeb Standard Port 8000
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Bot is running on Port 8000")
+    print("🚀 Bot is running with Channel Support on Port 8000")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-                                  
+    
