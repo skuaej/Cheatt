@@ -20,7 +20,7 @@ OWNER_ID = int(os.getenv("OWNER_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
 MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
 
-# Default ParseMode HTML set kar diya hai taaki <code> tag kaam kare
+# Bot with HTML ParseMode fixed
 bot = Bot(token=BOT_TOKEN, default_parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
@@ -58,7 +58,7 @@ async def handle_media(message: types.Message):
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # <code> tag ensures auto-copy on Telegram mobile
+        # <code> tag ensures auto-copy on Telegram. HTML parse mode will hide the tags.
         await message.reply(f"<code>/take {existing['caption']}</code>")
     else:
         if message.caption:
@@ -77,7 +77,7 @@ async def handle_media(message: types.Message):
                     upsert=True
                 )
                 
-                # Reply with ONLY the copyable command
+                # Success Reply: Just the copyable command
                 await message.reply(f"<code>/take {clean_name}</code>")
                 
                 # Silent Log
@@ -88,7 +88,7 @@ async def handle_media(message: types.Message):
             except Exception as e:
                 await message.reply(f"Error: {e}")
         else:
-            await message.reply("Bhai caption (name) toh likh!")
+            await message.reply("Bhai caption (name) toh likho!")
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
@@ -105,7 +105,7 @@ async def search_media(message: types.Message):
                 message_id=result["msg_id"]
             )
         except:
-            await message.reply("Error: Bot backup channel mein Admin nahi hai!")
+            await message.reply("Error: Bot channel mein Admin nahi hai!")
     else:
         await message.reply("Database mein nahi mila.")
 
@@ -138,6 +138,10 @@ async def main():
     await collection.create_index("file_unique_id", unique=True)
     await collection.create_index("caption")
     
+    # Show Total in Logs
+    total = await collection.count_documents({})
+    print(f"✅ DB Connected. Total Characters: {total}")
+
     app = web.Application()
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
@@ -145,10 +149,8 @@ async def main():
     # Koyeb Port 8000
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Port 8000 Started. Bot is Live.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-    
