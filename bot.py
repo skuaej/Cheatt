@@ -17,9 +17,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 OWNER_ID = int(os.getenv("OWNER_ID"))
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID"))
-MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
+MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID")) # Storage
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID")) # New Source
 
-# Bot with Default Markdown (No HTML)
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
@@ -29,7 +29,7 @@ collection = db["cheats"]
 
 # --- UTILS ---
 def parse_caption(text):
-    # Regex: 🆔️9828: Kaori Miyazono [🏖] -> "Kaori Miyazono"
+    # Pattern: 🆔️9828: Kaori Miyazono [🏖] -> "Kaori Miyazono"
     match = re.search(r"🆔️\d+:\s*([^\[\n\r]+)", text)
     if match:
         return match.group(1).strip()
@@ -51,48 +51,53 @@ def get_sys_info():
 
 @dp.message(F.photo | F.video)
 async def handle_media(message: types.Message):
+    # Photo/Video detection
     media = message.photo[-1] if message.photo else message.video
     unique_id = media.file_unique_id
     
+    # Check if duplicate
     existing = await collection.find_one({"file_unique_id": unique_id})
 
     if existing:
-        # Markdown backticks for one-tap copy
+        # Markdown backticks for one-tap copy (CLEAN)
         await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
     else:
         if message.caption:
             clean_name = parse_caption(message.caption)
             try:
-                # Backup to Media Channel
+                # Copy message to Media Backup Channel (Immortal)
                 backup = await bot.copy_message(
                     chat_id=MEDIA_CHANNEL_ID,
                     from_chat_id=message.chat.id,
                     message_id=message.message_id
                 )
                 
+                # Save Message ID and Name to DB
                 await collection.update_one(
                     {"file_unique_id": unique_id},
                     {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
                     upsert=True
                 )
                 
-                # REPLY: Only the copyable command
+                # Return one-tap copyable command
                 await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
                 
-                # Log to Channel
+                # Log to Log Channel
                 try:
-                    await bot.send_message(LOG_CHANNEL_ID, f"🆕 Saved: `{clean_name}`", parse_mode="Markdown")
+                    await bot.send_message(LOG_CHANNEL_ID, f"🆕 **Saved:** `{clean_name}`", parse_mode="Markdown")
                 except: pass
             except Exception as e:
-                await message.reply(f"Error: {e}")
+                await message.reply(f"❌ Error: {e}")
         else:
-            await message.reply("Bhai caption mein name toh likh!")
+            # Silence if no caption, or you can add a reminder
+            pass
 
 @dp.message(Command("search"))
 async def search_media(message: types.Message):
     query = message.text.replace("/search", "").strip().lower()
-    if not query: return await message.reply("Usage: /search Name")
+    if not query: return await message.reply("Usage: `/search Name`")
 
+    # Partial match search
     result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
     
     if result:
@@ -103,9 +108,9 @@ async def search_media(message: types.Message):
                 message_id=result["msg_id"]
             )
         except:
-            await message.reply("Error: Bot backup channel mein Admin nahi hai!")
+            await message.reply("❌ Error: Bot ko Backup Channel mein Admin banao!")
     else:
-        await message.reply("Database mein nahi mila.")
+        await message.reply("❌ Database mein nahi mila.")
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message):
@@ -114,12 +119,11 @@ async def cmd_ping(message: types.Message):
     latency = round((time.time() - start) * 1000)
     ram_u, ram_t, sto_u, sto_t = get_sys_info()
     
-    # Plain text ping, no HTML tags
     status_msg = (
-        f"🚀 Status: Healthy\n\n"
-        f"⏱ Ping: {latency}ms\n"
-        f"📟 RAM: {ram_u}MB / {ram_t}MB\n"
-        f"💾 Storage: {sto_u}GB / {sto_t}GB"
+        f"🚀 **Bot Health:** Healthy\n"
+        f"⏱ **Ping:** `{latency}ms`\n"
+        f"📟 **RAM:** `{ram_u}MB / {ram_t}MB`\n"
+        f"💾 **Storage:** `{sto_u}GB / {sto_t}GB`"
     )
     await msg.edit_text(text=status_msg)
 
@@ -127,12 +131,11 @@ async def cmd_ping(message: types.Message):
 async def cmd_total(message: types.Message):
     if message.from_user.id != OWNER_ID: return
     count = await collection.count_documents({})
-    # Plain text total
-    await message.reply(f"📊 Total Characters in DB: {count}")
+    await message.reply(f"📊 **Total Database:** `{count}`")
 
-# --- KOYEB PORT 8000 SERVER ---
+# --- KOYEB PORT 8000 ---
 async def health_check(request):
-    return web.Response(text="Bot is Alive", status=200)
+    return web.Response(text="Bot Alive", status=200)
 
 async def main():
     await collection.create_index("file_unique_id", unique=True)
@@ -142,13 +145,13 @@ async def main():
     app.router.add_get("/", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
-    # Koyeb Port 8000
+    # Koyeb Standard Port 8000
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Port 8000 Active. Bot is running.")
+    print("🚀 Bot is running on Port 8000")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
-    
+                                  
