@@ -5,7 +5,7 @@ import re
 import logging
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramRetryAfter, TelegramConflictError
 from motor.motor_asyncio import AsyncIOMotorClient
 from aiohttp import web
 from dotenv import load_dotenv
@@ -26,14 +26,12 @@ client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
 
-# --- TURBO SEMAPHORE ---
-# Ab ek saath 5 media process honge (Fast & Safe)
+# Semaphore (5 media at a time)
 sem = asyncio.Semaphore(5)
 
 # --- UTILS ---
 def parse_caption(text):
     if not text: return None
-    # Flexible Regex: ID ke bina bhi naam nikal lega agar format thoda alag ho
     match = re.search(r"(?:🆔️\d+:\s*)?([^\[\n\r]+)", text)
     if match:
         return match.group(1).strip()
@@ -43,72 +41,74 @@ def parse_caption(text):
 async def process_and_save(message: types.Message):
     async with sem:
         media = message.photo[-1] if message.photo else message.video
-        if not media:
-            print("⚠️ SKIPPED: No Photo/Video found in message.")
-            return
+        if not media: return
         
         unique_id = media.file_unique_id
-        
-        # 1. DB Check
         existing = await collection.find_one({"file_unique_id": unique_id})
+
         if existing:
-            print(f"⏩ SKIPPED: Duplicate media found ({existing['caption']})")
+            await message.reply(f"`/take {existing['caption']}`", parse_mode="Markdown")
             return 
 
         clean_name = parse_caption(message.caption)
-        if not clean_name:
-            print("⚠️ SKIPPED: Caption missing or could not be parsed.")
-            return
+        if not clean_name: return
 
         try:
-            # 2. Backup to Channel
             backup = await bot.copy_message(
                 chat_id=MEDIA_CHANNEL_ID,
                 from_chat_id=message.chat.id,
                 message_id=message.message_id
             )
-            
-            # 3. DB Save
             await collection.update_one(
                 {"file_unique_id": unique_id},
                 {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
                 upsert=True
             )
-            
-            print(f"✅ SUCCESSFULLY SAVED: {clean_name}")
-            
-            # 4. Small delay to prevent Flood (1 sec is enough for 5 parallel tasks)
+            print(f"✅ SAVED: {clean_name}")
+            await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
             await asyncio.sleep(1)
-
-        except TelegramRetryAfter as e:
-            print(f"⚠️ Flood limit hit! Sleeping for {e.retry_after}s")
-            await asyncio.sleep(e.retry_after)
-            await process_and_save(message) # Retry
         except Exception as e:
-            print(f"❌ ERROR saving {clean_name}: {e}")
+            print(f"❌ ERROR: {e}")
 
-# --- HANDLERS ---
+# --- ALL COMMANDS (RESTORED & FIXED) ---
 
-@dp.message(F.photo | F.video)
-async def handle_private(message: types.Message):
-    await process_and_save(message)
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.reply("Bot is Alive! Send me photos with captions or use /search.")
 
-@dp.channel_post(F.photo | F.video)
-async def handle_channel(message: types.Message):
-    # Support both int and string comparisons for ID
-    if str(message.chat.id) == str(SOURCE_CHANNEL_ID):
-        await process_and_save(message)
+@dp.message(Command("search"))
+async def search_media(message: types.Message):
+    query = message.text.replace("/search", "").strip()
+    if not query: return await message.reply("Bhai name toh likh! `/search Name`")
+    
+    result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
+    if result:
+        await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=result["msg_id"])
     else:
-        print(f"ℹ️ Received post from unknown channel: {message.chat.id}")
+        await message.reply("❌ Database mein nahi mila.")
 
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
     count = await collection.count_documents({})
     await message.reply(f"📊 **Total Database:** `{count}`")
 
+@dp.message(Command("ping"))
+async def cmd_ping(message: types.Message):
+    await message.reply("⚡ **Pong!** Bot is running perfectly.")
+
+# Handle Media
+@dp.message(F.photo | F.video)
+async def handle_private(message: types.Message):
+    await process_and_save(message)
+
+@dp.channel_post(F.photo | F.video)
+async def handle_channel(message: types.Message):
+    if str(message.chat.id) == str(SOURCE_CHANNEL_ID):
+        await process_and_save(message)
+
 # --- KOYEB SERVER ---
 async def health_check(request):
-    return web.Response(text="Bot is Alive and Saving!", status=200)
+    return web.Response(text="Healthy", status=200)
 
 async def main():
     await collection.create_index("file_unique_id", unique=True)
@@ -119,10 +119,12 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', 8000).start()
     
-    print("🚀 Turbo Engine Started. Handling bulk forwards...")
+    # --- CONFLICT KILLER ---
+    print("🛠 Cleaning existing sessions...")
+    await bot.delete_webhook(drop_pending_updates=True)
     
-    # skip_updates=True ensures we don't get flooded with old failed attempts
-    await dp.start_polling(bot, skip_updates=True, drop_pending_updates=True)
+    print("🚀 Bot is starting fresh...")
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
