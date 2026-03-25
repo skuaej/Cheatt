@@ -3,7 +3,6 @@ import time
 import asyncio
 import re
 import logging
-import psutil
 import shutil
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -23,7 +22,6 @@ MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID"))
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# MongoDB Setup
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
@@ -37,13 +35,15 @@ def parse_caption(text):
     return text.split('\n')[0].strip()
 
 def get_sys_info():
-    mem = psutil.virtual_memory()
-    ram_used = round(mem.used / (1024**2), 2)
-    ram_total = round(mem.total / (1024**2), 2)
+    try:
+        with open('/proc/meminfo', 'r') as f:
+            lines = f.readlines()
+        mem_total = int(lines[0].split()[1]) / 1024
+        ram_u = round(mem_total - (int(lines[1].split()[1]) / 1024), 2)
+        ram_t = round(mem_total, 2)
+    except: ram_u, ram_t = 0, 0
     total, used, free = shutil.disk_usage("/")
-    sto_used = round(used / (1024**3), 2)
-    sto_total = round(total / (1024**3), 2)
-    return ram_used, ram_total, sto_used, sto_total
+    return ram_u, ram_t, round(used / (1024**3), 2), round(total / (1024**3), 2)
 
 # --- HANDLERS ---
 
@@ -69,31 +69,44 @@ async def handle_media(message: types.Message):
                 
                 await collection.update_one(
                     {"file_unique_id": unique_id},
-                    {"$set": {
-                        "msg_id": backup.message_id,
-                        "caption": clean_name
-                    }},
+                    {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
                     upsert=True
                 )
-                # Format fixed: No extra quotes, one-tap copy
+                
+                # LOG TO CHANNEL: Naya character add hone par
+                log_msg = f"🆕 **New Character Added!**\n\n**Name:** `{clean_name}`\n**ID:** `{unique_id}`"
+                await bot.send_message(LOG_CHANNEL_ID, log_text=log_msg)
+                
                 await message.reply(f"📥 **Saved!**\n\n`/take {clean_name}`")
             except Exception as e:
                 await message.reply(f"❌ Error: {e}")
+
+@dp.message(Command("search"))
+async def search_media(message: types.Message):
+    query = message.text.replace("/search", "").strip().lower()
+    if not query: return await message.reply("Usage: `/search Name`")
+
+    result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
+    if result:
+        await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=result["msg_id"])
+    else:
+        await message.reply("❌ Database mein nahi mila.")
 
 @dp.message(Command("ping"))
 async def cmd_ping(message: types.Message):
     start_time = time.time()
     msg = await message.answer("⚡ Checking System...")
     latency = round((time.time() - start_time) * 1000)
-    
     ram_u, ram_t, sto_u, sto_t = get_sys_info()
+    
     status_msg = (
         f"🚀 **Bot Health: Healthy**\n\n"
         f"⏱ **Ping:** `{latency}ms`\n"
         f"📟 **RAM:** `{ram_u}MB / {ram_t}MB`\n"
         f"💾 **Storage:** `{sto_u}GB / {sto_t}GB`"
     )
-    await msg.edit(text=status_msg)
+    # FIX: edit() ki jagah edit_text()
+    await msg.edit_text(text=status_msg)
 
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
@@ -101,40 +114,29 @@ async def cmd_total(message: types.Message):
     count = await collection.count_documents({})
     await message.reply(f"📊 **Total Database:** `{count}`")
 
-# --- KOYEB SERVER (Fixed Concurrency) ---
+# --- KOYEB SERVER (Port 8000 FIX) ---
 async def health_check(request):
-    return web.Response(text="I am alive!", status=200)
-
-async def start_server():
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    # 0.0.0.0 is mandatory for Koyeb health checks
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
-    await site.start()
-    print("✅ Port 8080 Web Server Started.")
+    return web.Response(text="Bot Alive", status=200)
 
 async def main():
-    # 1. Database Indexing
     await collection.create_index("file_unique_id", unique=True)
     
-    # 2. Show Total Characters in Logs on Startup
+    # Startup Log
     total_chars = await collection.count_documents({})
     print("=" * 40)
     print(f"📊 STARTUP LOG: Total Characters in DB: {total_chars}")
     print("=" * 40)
 
-    # 3. Start Web Server
-    await start_server()
-
-    # 4. Start Bot Polling
-    print("🚀 Bot Polling Started...")
+    # Server on Port 8000 (Koyeb standard)
+    app = web.Application()
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', 8000).start()
+    
+    print("🚀 Port 8000 Web Server Started. Health check should pass.")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logging.info("Bot Stopped!")
+    asyncio.run(main())
