@@ -98,16 +98,24 @@ async def process_and_save(message: types.Message):
             unique_id = media.file_unique_id
             full_caption = message.caption or ""
             
+            # 1. ALWAYS CHECK IF IT EXISTS FIRST
+            existing = await collection.find_one({"file_unique_id": unique_id})
+            if existing:
+                e_name = existing.get('char_name', 'Unknown')
+                return await message.reply(f"/take {e_name}")
+
+            # 2. GUARD CLAUSE: PREVENT SAVING SPAWN MESSAGES
+            # If the bot doesn't know the image, and the caption is a spawn message, ABORT!
+            forbidden_phrases = ["spawned into the chat", "new character has spawned", "use /take"]
+            if any(phrase in full_caption.lower() for phrase in forbidden_phrases):
+                return await message.reply("❌ Image not found in database! (The target bot used a new File ID)")
+
+            # 3. IF IT IS A VALID NEW CHARACTER, PROCEED TO SAVE
             last = await collection.find_one({"serial_id": {"$exists": True}}, sort=[("serial_id", -1)])
             assigned_id = (int(last["serial_id"]) + 1) if last else 1
             
             char_name = clean_name_strict(full_caption)
             new_clean_cap = format_to_new_fashion(full_caption, assigned_id)
-
-            existing = await collection.find_one({"file_unique_id": unique_id})
-            if existing:
-                e_name = existing.get('char_name') or "Unknown"
-                return await message.reply(f"/take {e_name}")
 
             try:
                 backup = await bot.copy_message(
@@ -135,7 +143,7 @@ async def process_and_save(message: types.Message):
             await asyncio.sleep(4.5)
 
         except Exception as e:
-            logging.error(f"Save Error: {e}")
+            logging.error(f"Save Error: {e}", exc_info=True)
 
 # --- COMMANDS ---
 @dp.message(Command("check"))
