@@ -1,14 +1,14 @@
 import os
-import time
 import asyncio
 import re
 import logging
-import shutil
+import unicodedata
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramRetryAfter
+from aiogram.client.session.aiohttp import AiohttpSession
 from motor.motor_asyncio import AsyncIOMotorClient
-from aiohttp import web
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,132 +16,160 @@ load_dotenv()
 # --- CONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-OWNER_ID = int(os.getenv("OWNER_ID"))
 MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID")) 
 SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
 
-bot = Bot(token=BOT_TOKEN)
+session = AiohttpSession()
+bot = Bot(token=BOT_TOKEN, session=session, default_parse_mode=ParseMode.HTML)
 dp = Dispatcher()
 
 client = AsyncIOMotorClient(MONGO_URI)
 db = client["CheatBotDB"]
 collection = db["cheats"]
 
-# Semaphore to handle heavy load without crashing Koyeb
 sem = asyncio.Semaphore(1)
 
 # --- UTILS ---
-def parse_caption(text):
-    if not text: return None
-    match = re.search(r"(?:🆔️\d+:\s*)?([^\[\n\r]+)", text)
-    if match:
-        return match.group(1).strip()
-    return text.split('\n')[0].strip()
+def normalize_text(text):
+    if not text: return ""
+    return "".join(c for c in unicodedata.normalize('NFKD', text) if not unicodedata.combining(c)).lower()
 
-# --- THE IMMORTAL SAVER ---
+def clean_name_strict(text):
+    """Purani ID aur kachra saaf karke sirf character name nikalne ke liye"""
+    if not text: return "Unknown"
+    # 1. Catch lines with or without 🆔, starting with numbers
+    match = re.search(r"(?:🆔|🆔️)?\s*\d+\s*[:\s-]+([^\[\n\r🔞💍]+)", text)
+    if match:
+        name = match.group(1).strip()
+    else:
+        # Agar ID line nahi hai toh pehli valid line uthao
+        lines = [l.strip() for l in text.split('\n') if l.strip() and "OwO" not in l]
+        name = lines[0] if lines else "Unknown"
+    
+    # 2. FINAL CLEAN: Kisi bhi haal mein agar aage numbers bache hain toh udao
+    name = re.sub(r"^\d+[:\s]*", "", name).strip()
+    return name
+
+def format_to_new_fashion(text, assigned_id):
+    """Backup channel ke liye caption, jisme naya ALLOTTED ID hoga, purana nahi."""
+    if not text: return ""
+    text = text.replace("<b>", "").replace("</b>", "")
+    raw_lines = [l.strip() for l in text.split('\n') if l.strip()]
+    
+    # Faltu words skip karne ke liye
+    forbidden = ["OwO", "➼", "Added by", "Updated by", "User:", "@", "🍬", "𝑃𝑟𝑒𝑚𝑖𝑒𝑟", "🆔"]
+    
+    anime, name, rarity = "Unknown", "Unknown", "Unknown"
+    card_type = ""
+    
+    # Pehle strict name nikal lo
+    name = clean_name_strict(text)
+
+    for line in raw_lines:
+        # Agar line me kachra hai, skip karo
+        if any(x in line for x in forbidden):
+            continue
+        # Purani ID wali line skip karo (jo number se shuru hoti hai)
+        if re.match(r"^\d+[:\s]", line):
+            continue
+            
+        if "RARITY" in line.upper() or "𝙍𝘼𝙍𝙄𝙏𝙔" in line:
+            match = re.search(r"(?:RARITY|𝙍𝘼𝙍𝙄𝙏𝙔)\s*[:\s]*([^\)\n\r]+)", line, re.IGNORECASE)
+            rarity = match.group(1).strip() if match else line
+        elif anime == "Unknown" and name not in line and len(line) > 2:
+            anime = line
+        else:
+            # Type / Edition nikalne ke liye
+            if len(line) > 1 and line != anime and line != rarity:
+                card_type = line
+
+    # Yahan humne naya allotted ID add kar diya hai
+    caption = (
+        f"Name: {name}\n"
+        f"Artist/Anime: {anime}\n"
+        f"Rarity: {rarity}\n"
+        f"ID: {assigned_id}"
+    )
+    
+    if card_type:
+        caption += f"\nType: {card_type}"
+        
+    return caption
+
+# --- CORE SAVER ---
 async def process_and_save(message: types.Message):
-    async with sem:
-        try:
-            media = message.photo[-1] if message.photo else message.video
-            if not media: return
-            
-            unique_id = media.file_unique_id
-            
-            # Check DB (Avoid saving the same file twice)
-            existing = await collection.find_one({"file_unique_id": unique_id})
-            if existing:
-                return 
+    async with sem:
+        try:
+            media = message.photo[-1] if message.photo else message.video
+            if not media: return
+            
+            unique_id = media.file_unique_id
+            full_caption = message.caption or ""
+            
+            # Serial ID Calculation
+            last = await collection.find_one({"serial_id": {"$exists": True}}, sort=[("serial_id", -1)])
+            assigned_id = (int(last["serial_id"]) + 1) if last else 1
+            
+            # Updated Formatting
+            char_name = clean_name_strict(full_caption)
+            # Yahan assigned_id pass kiya backup caption ke liye
+            new_clean_cap = format_to_new_fashion(full_caption, assigned_id)
 
-            clean_name = parse_caption(message.caption)
-            if not clean_name: return
+            existing = await collection.find_one({"file_unique_id": unique_id})
+            if existing:
+                e_name = existing.get('char_name') or "Unknown"
+                # Reply mein sirf Name aayega
+                return await message.reply(f"/take {e_name}")
 
-            # 1. Backup to Storage with 30s Timeout
-            try:
-                backup = await asyncio.wait_for(
-                    bot.copy_message(
-                        chat_id=MEDIA_CHANNEL_ID,
-                        from_chat_id=message.chat.id,
-                        message_id=message.message_id
-                    ), timeout=30
-                )
-                
-                # 2. Save to Database
-                await collection.update_one(
-                    {"file_unique_id": unique_id},
-                    {"$set": {"msg_id": backup.message_id, "caption": clean_name}},
-                    upsert=True
-                )
-                
-                print(f"✅ SAVED: {clean_name}")
-                
-                # 3. Clean Reply (One-tap copy)
-                await message.reply(f"`/take {clean_name}`", parse_mode="Markdown")
-                
-                # Safe gap for Telegram Flood Control
-                await asyncio.sleep(2.5)
+            # Backup channel mein ID ke sath update hoga
+            backup = await bot.copy_message(
+                chat_id=MEDIA_CHANNEL_ID, 
+                from_chat_id=message.chat.id, 
+                message_id=message.message_id,
+                caption=new_clean_cap
+            )
+            
+            await collection.update_one({"file_unique_id": unique_id}, {"$set": {
+                "serial_id": assigned_id, "msg_id": backup.message_id, "char_name": char_name,
+                "full_info": full_caption, "search_field": normalize_text(full_caption)
+            }}, upsert=True)
+            
+            # Chat ka reply abhi bhi clean rahega
+            await message.reply(f"/take {char_name}")
+            await asyncio.sleep(4.5)
 
-            except asyncio.TimeoutError:
-                print(f"⏳ TIMEOUT: Skipping {clean_name} as it took too long.")
-            
-        except TelegramRetryAfter as e:
-            print(f"⚠️ FLOOD WAIT: Sleeping for {e.retry_after}s")
-            await asyncio.sleep(e.retry_after + 2)
-            await process_and_save(message)
-        except Exception as e:
-            print(f"❌ PROCESS ERROR: {e}")
+        except Exception as e:
+            logging.error(f"Save Error: {e}")
 
 # --- COMMANDS ---
 
-@dp.message(Command("search"))
-async def search_media(message: types.Message):
-    query = message.text.replace("/search", "").strip()
-    if not query: return await message.reply("Usage: `/search Name`")
-    
-    result = await collection.find_one({"caption": {"$regex": query, "$options": "i"}})
-    if result:
-        await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=result["msg_id"])
-    else:
-        await message.reply("❌ Database mein nahi mila.")
+@dp.message(Command("check"))
+async def cmd_check(message: types.Message):
+    args = message.text.split()
+    if len(args) < 2: return
+    try:
+        res = await collection.find_one({"serial_id": int(args[1])})
+        if res:
+            await bot.copy_message(chat_id=message.chat.id, from_chat_id=MEDIA_CHANNEL_ID, message_id=res["msg_id"])
+        else:
+            await message.reply(f"❌ Not in that ID: {args[1]}")
+    except: pass
 
 @dp.message(Command("total"))
 async def cmd_total(message: types.Message):
-    count = await collection.count_documents({})
-    await message.reply(f"📊 **Total in DB:** `{count}`")
+    count = await collection.count_documents({})
+    await message.reply(f"📊 Total Database: {count}")
 
-@dp.message(Command("ping"))
-async def cmd_ping(message: types.Message):
-    await message.answer("⚡ **Bot is Healthy & Online!**")
-
-# --- HANDLERS ---
 @dp.message(F.photo | F.video)
-async def handle_private(message: types.Message):
-    await process_and_save(message)
+async def handle_media(message: types.Message):
+    if message.chat.type == "private" or message.chat.id == SOURCE_CHANNEL_ID:
+        await process_and_save(message)
 
-@dp.channel_post(F.photo | F.video)
-async def handle_channel(message: types.Message):
-    if str(message.chat.id) == str(SOURCE_CHANNEL_ID):
-        await process_and_save(message)
-
-# --- KOYEB SERVER ---
-async def health_check(request):
-    return web.Response(text="Bot is Alive", status=200)
-
+# --- MAIN ---
 async def main():
-    await collection.create_index("file_unique_id", unique=True)
-    
-    app = web.Application()
-    app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', 8000).start()
-    
-    # Conflict Killer: Hard reset sessions
-    await bot.delete_webhook(drop_pending_updates=True)
-    print("🚀 Heavy-Loader Engine Started. Queue active.")
-    
-    await dp.start_polling(bot)
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("🚀 Allotted ID in Backup Engine Started!")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    asyncio.run(main())
-    
+    asyncio.run(main())
