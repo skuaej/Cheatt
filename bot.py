@@ -3,6 +3,7 @@ import asyncio
 import re
 import logging
 import unicodedata
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
@@ -16,8 +17,8 @@ load_dotenv()
 # --- CONFIG ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
-MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID")) 
-SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID"))
+MEDIA_CHANNEL_ID = int(os.getenv("MEDIA_CHANNEL_ID", "0")) 
+SOURCE_CHANNEL_ID = int(os.getenv("SOURCE_CHANNEL_ID", "0"))
 
 session = AiohttpSession()
 bot = Bot(token=BOT_TOKEN, session=session, default_parse_mode=ParseMode.HTML)
@@ -108,12 +109,22 @@ async def process_and_save(message: types.Message):
                 e_name = existing.get('char_name') or "Unknown"
                 return await message.reply(f"/take {e_name}")
 
-            backup = await bot.copy_message(
-                chat_id=MEDIA_CHANNEL_ID, 
-                from_chat_id=message.chat.id, 
-                message_id=message.message_id,
-                caption=new_clean_cap
-            )
+            try:
+                backup = await bot.copy_message(
+                    chat_id=MEDIA_CHANNEL_ID, 
+                    from_chat_id=message.chat.id, 
+                    message_id=message.message_id,
+                    caption=new_clean_cap
+                )
+            except TelegramRetryAfter as e:
+                logging.warning(f"Rate limited by Telegram. Sleeping for {e.retry_after} seconds...")
+                await asyncio.sleep(e.retry_after)
+                backup = await bot.copy_message(
+                    chat_id=MEDIA_CHANNEL_ID, 
+                    from_chat_id=message.chat.id, 
+                    message_id=message.message_id,
+                    caption=new_clean_cap
+                )
             
             await collection.update_one({"file_unique_id": unique_id}, {"$set": {
                 "serial_id": assigned_id, "msg_id": backup.message_id, "char_name": char_name,
@@ -149,11 +160,29 @@ async def handle_media(message: types.Message):
     if message.chat.type == "private" or message.chat.id == SOURCE_CHANNEL_ID:
         await process_and_save(message)
 
+# --- DUMMY WEB SERVER (Keeps Koyeb Awake) ---
+async def handle_ping(request):
+    return web.Response(text="Bot is awake and running!")
+
 # --- MAIN ---
 async def main():
+    # 1. Setup the Dummy Web Server
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    # Koyeb uses the PORT environment variable (default 8000)
+    port = int(os.environ.get("PORT", 8000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Dummy web server started on port {port}")
+
+    # 2. Start the Bot Polling
     await bot.delete_webhook(drop_pending_updates=True)
     print("🚀 Allotted ID in Backup Engine Started!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
